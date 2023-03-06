@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import torch
 
 from lhotse import AudioSource, CutSet, MonoCut, Recording, SupervisionSegment
 from lhotse.audio import RecordingSet
@@ -394,6 +395,43 @@ def test_mixed_cut_start01_reverb_rir(cut_with_supervision_start01, rir):
     )
 
 
+def test_mixed_cut_start01_reverb_rir_with_fast_random(
+    cut_with_supervision_start01, rir
+):
+    mixed_rvb = cut_with_supervision_start01.append(
+        cut_with_supervision_start01
+    ).reverb_rir()
+    assert mixed_rvb.start == 0  # MixedCut always starts at 0
+    assert mixed_rvb.duration == cut_with_supervision_start01.duration * 2
+    assert mixed_rvb.end == cut_with_supervision_start01.duration * 2
+    assert mixed_rvb.num_samples == cut_with_supervision_start01.num_samples * 2
+
+    assert (
+        mixed_rvb.supervisions[0].start
+        == cut_with_supervision_start01.supervisions[0].start
+    )
+    assert (
+        mixed_rvb.supervisions[0].duration
+        == cut_with_supervision_start01.supervisions[0].duration
+    )
+    assert (
+        mixed_rvb.supervisions[0].end
+        == cut_with_supervision_start01.supervisions[0].end
+    )
+    assert mixed_rvb.supervisions[1].start == (
+        cut_with_supervision_start01.duration
+        + cut_with_supervision_start01.supervisions[0].start
+    )
+    assert (
+        mixed_rvb.supervisions[1].duration
+        == cut_with_supervision_start01.supervisions[0].duration
+    )
+    assert mixed_rvb.supervisions[1].end == (
+        cut_with_supervision_start01.duration
+        + cut_with_supervision_start01.supervisions[0].end
+    )
+
+
 @pytest.mark.parametrize(
     "rir_channels, expected_num_tracks",
     [([0], 2), ([0, 1], 2), ([0, 1, 2], None)],
@@ -534,12 +572,31 @@ def test_cut_reverb_rir(libri_cut_with_supervision, libri_recording_rvb, rir):
     np.testing.assert_array_almost_equal(cut_rvb.load_audio(), rvb_audio_from_fixture)
 
 
+def test_cut_reverb_fast_rir(libri_cut_with_supervision):
+    cut = libri_cut_with_supervision
+    cut_rvb = cut.reverb_rir(rir_recording=None)
+    assert cut_rvb.start == cut.start
+    assert cut_rvb.duration == cut.duration
+    assert cut_rvb.end == cut.end
+    assert cut_rvb.num_samples == cut.num_samples
+
+    assert cut_rvb.recording.duration == cut.recording.duration
+    assert cut_rvb.recording.num_samples == cut.recording.num_samples
+
+    assert cut_rvb.supervisions[0].start == cut.supervisions[0].start
+    assert cut_rvb.supervisions[0].duration == cut.supervisions[0].duration
+    assert cut_rvb.supervisions[0].end == cut.supervisions[0].end
+
+    assert cut_rvb.load_audio().shape == cut.load_audio().shape
+    assert cut_rvb.recording.load_audio().shape == cut.recording.load_audio().shape
+
+
 @pytest.mark.parametrize(
     "rir_channels, expected_type, expected_num_tracks",
     [
         ([0], "MonoCut", 1),
         ([1], "MonoCut", 1),
-        ([0, 1], "MixedCut", 2),
+        ([0, 1], "MultiCut", 2),
     ],
 )
 def test_cut_reverb_multi_channel_rir(

@@ -1,7 +1,10 @@
 import functools
 import logging
+import os
 import random
 import re
+import sys
+import traceback
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
@@ -148,7 +151,7 @@ class AudioSource:
         :param force_opus_sampling_rate: This parameter is only used when we detect an OPUS file.
             It will tell ffmpeg to resample OPUS to this sampling rate.
         """
-        assert self.type in ("file", "command", "url", "memory")
+        assert self.type in ("file", "command", "url", "memory", "shar")
 
         # TODO: refactor when another source type is added
         source = self.source
@@ -187,11 +190,16 @@ class AudioSource:
         elif self.type == "memory":
             assert isinstance(self.source, bytes), (
                 "Corrupted manifest: specified AudioSource type is 'memory', "
-                "but 'self.source' attribute is not of type 'bytes'."
+                f"but 'self.source' attribute is not of type 'bytes' (found: '{type(self.source).__name__}')."
             )
             source = BytesIO(self.source)
             samples, sampling_rate = read_audio(
                 source, offset=offset, duration=duration
+            )
+        elif self.type == "shar":
+            raise RuntimeError(
+                "Inconsistent state: found an AudioSource with Lhotse Shar placeholder "
+                "that was not filled during deserialization."
             )
 
         else:  # self.type == 'file'
@@ -312,7 +320,18 @@ class Recording:
     sampling_rate: int
     num_samples: int
     duration: Seconds
+    channel_ids: Optional[List[int]] = None
     transforms: Optional[List[Dict]] = None
+
+    def __post_init__(self):
+        if self.channel_ids is None:
+            self.channel_ids = sorted(
+                cid for source in self.sources for cid in source.channels
+            )
+
+    @property
+    def num_channels(self):
+        return len(self.channel_ids)
 
     @staticmethod
     def from_file(
@@ -456,7 +475,7 @@ class Recording:
             channels=channels, offset=ifnone(offset, 0), duration=duration
         )
         stream = BytesIO()
-        torchaudio.save(
+        torchaudio_save_flac_safe(
             stream, torch.from_numpy(audio), self.sampling_rate, format=format
         )
         channels = (ifnone(channels, self.channel_ids),)
@@ -481,48 +500,19 @@ class Recording:
 
     def to_cut(self):
         """
-        Create a Cut out of this recording.
-
-        For single-channel recordings, we return a :class:`MonoCut`.
-        For multi-channel recordings, we return a :class:`MixedCut` with as
-        many tracks as the number of channels.
-        The implementation of the multi-channel case may change in the future...
+        Create a Cut out of this recording --- MonoCut or MultiCut, depending on the
+        number of channels.
         """
-        from lhotse.cut import MixedCut, MixTrack, MonoCut
+        from lhotse.cut import MonoCut, MultiCut
 
-        if self.num_channels == 1:
-            return MonoCut(
-                id=self.id,
-                start=0.0,
-                duration=self.duration,
-                channel=self.channel_ids[0],
-                recording=self,
-            )
-        else:
-            # TODO: if we ever have "MultiCut" we may replace this implementation
-            return MixedCut(
-                id=self.id,
-                tracks=[
-                    MixTrack(
-                        cut=MonoCut(
-                            id=f"{self.id}_ch{cidx}",
-                            start=0.0,
-                            duration=self.duration,
-                            channel=cidx,
-                            recording=self,
-                        )
-                    )
-                    for cidx in self.channel_ids
-                ],
-            )
-
-    @property
-    def num_channels(self):
-        return sum(len(source.channels) for source in self.sources)
-
-    @property
-    def channel_ids(self):
-        return sorted(cid for source in self.sources for cid in source.channels)
+        cls = MonoCut if self.num_channels == 1 else MultiCut
+        return cls(
+            id=self.id,
+            start=0.0,
+            duration=self.duration,
+            channel=self.channel_ids[0] if self.num_channels == 1 else self.channel_ids,
+            recording=self,
+        )
 
     @rich_exception_info
     def load_audio(
@@ -624,11 +614,12 @@ class Recording:
                 s[None, :] if s.ndim == 1 else s for s in samples_per_source
             ]
             max_samples = max(s.shape[1] for s in samples_per_source)
-            for s in samples_per_source:
+            for i, s in enumerate(samples_per_source):
                 if max_samples - s.shape[1] <= allowed_diff:
                     s = np.pad(s, ((0, 0), (0, max_samples - s.shape[1])), "constant")
+                    samples_per_source[i] = s
                 else:
-                    raise ValueError(
+                    raise DurationMismatchError(
                         f"The mismatch between the number of samples in the "
                         f"different channels of the recording {self.id} is "
                         f"greater than the allowed tolerance {LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE}."
@@ -717,15 +708,18 @@ class Recording:
 
     def reverb_rir(
         self,
-        rir_recording: "Recording",
+        rir_recording: Optional["Recording"] = None,
         normalize_output: bool = True,
         early_only: bool = False,
         affix_id: bool = True,
         rir_channels: Optional[List[int]] = None,
+        room_rng_seed: Optional[int] = None,
+        source_rng_seed: Optional[int] = None,
     ) -> "Recording":
         """
         Return a new ``Recording`` that will lazily apply reverberation based on provided
-        impulse response while loading audio.
+        impulse response while loading audio. If no impulse response is provided, we will
+        generate an RIR using a fast random generator (https://arxiv.org/abs/2208.04101).
 
         :param rir_recording: The impulse response to be used.
         :param normalize_output: When true, output will be normalized to have energy as input.
@@ -733,21 +727,54 @@ class Recording:
         :param affix_id: When true, we will modify the ``Recording.id`` field
             by affixing it with "_rvb".
         :param rir_channels: The channels of the impulse response to be used (in case of multi-channel
-            impulse responses). By default, only the first channel is used.
+            impulse responses). By default, only the first channel is used. If no RIR is
+            provided, we will generate one with as many channels as this argument specifies.
+        :param room_rng_seed: The seed to be used for the room configuration.
+        :param source_rng_seed: The seed to be used for the source position.
         :return: the perturbed ``Recording``.
         """
+
+        # We may need to change the `channel_ids` field according to whether we are convolving
+        # with a multi-channel RIR or not.
+        # The following cases are possible:
+        # Case 1: input is mono, rir is mono -> mono output, no need to change
+        # Case 2: input is mono, rir is multi-channel -> multi-channel output, change channel_ids
+        # Case 3: input is multi-channel, rir is mono -> multi-channel output, no need to change
+        # Case 4: input is multi-channel, rir is multi-channel -> multi-channel output,
+        #   no need to change (since we assume that the RIR has the same number of channels as the input)
+
+        if self.num_channels > 1 or rir_channels is None or len(rir_channels) == 1:
+            # Case 1, 3 or 4
+            new_channel_ids = self.channel_ids
+        else:
+            # Case 2
+            new_channel_ids = list(range(len(rir_channels)))
+
+        if rir_recording is None:
+            from lhotse.augmentation.utils import FastRandomRIRGenerator
+
+            rir_generator = FastRandomRIRGenerator(
+                sr=self.sampling_rate,
+                room_seed=room_rng_seed,
+                source_seed=source_rng_seed,
+            )
+        else:
+            rir_generator = None
+
         transforms = self.transforms.copy() if self.transforms is not None else []
         transforms.append(
             ReverbWithImpulseResponse(
-                rir_recording,
+                rir=rir_recording,
                 normalize_output=normalize_output,
                 early_only=early_only,
                 rir_channels=rir_channels if rir_channels is not None else [0],
+                rir_generator=rir_generator,
             ).to_dict()
         )
         return fastcopy(
             self,
             id=f"{self.id}_rvb" if affix_id else self.id,
+            channel_ids=new_channel_ids,
             transforms=transforms,
         )
 
@@ -1096,15 +1123,18 @@ class RecordingSet(Serializable, AlgorithmMixin):
 
     def reverb_rir(
         self,
-        rir_recordings: "RecordingSet",
+        rir_recordings: Optional["RecordingSet"] = None,
         normalize_output: bool = True,
         early_only: bool = False,
         affix_id: bool = True,
         rir_channels: List[int] = [0],
+        room_rng_seed: Optional[int] = None,
+        source_rng_seed: Optional[int] = None,
     ) -> "RecordingSet":
         """
         Return a new ``RecordingSet`` that will lazily apply reverberation based on provided
-        impulse responses while loading audio.
+        impulse responses while loading audio. If no ``rir_recordings`` are provided, we will
+        generate a set of impulse responses using a fast random generator (https://arxiv.org/abs/2208.04101).
 
         :param rir_recordings: The impulse responses to be used.
         :param normalize_output: When true, output will be normalized to have energy as input.
@@ -1112,17 +1142,22 @@ class RecordingSet(Serializable, AlgorithmMixin):
         :param affix_id: When true, we will modify the ``Recording.id`` field
             by affixing it with "_rvb".
         :param rir_channels: The channels to be used for the RIRs (if multi-channel). Uses first
-            channel by default.
+            channel by default. If no RIR is provided, we will generate one with as many channels
+            as this argument specifies.
+        :param room_rng_seed: The seed to be used for the room configuration.
+        :param source_rng_seed: The seed to be used for the source positions.
         :return: a ``RecordingSet`` containing the perturbed ``Recording`` objects.
         """
         rir_recordings = list(rir_recordings)
         return RecordingSet.from_recordings(
             r.reverb_rir(
-                rir_recording=random.choice(rir_recordings),
+                rir_recording=random.choice(rir_recordings) if rir_recordings else None,
                 normalize_output=normalize_output,
                 early_only=early_only,
                 affix_id=affix_id,
                 rir_channels=rir_channels,
+                room_rng_seed=room_rng_seed,
+                source_rng_seed=source_rng_seed,
             )
             for r in self
         )
@@ -1173,6 +1208,16 @@ class AudioMixer:
     The time offset is relative to the start of the reference signal
     (only positive values are supported).
     The SNR is relative to the energy of the signal used to initialize the ``AudioMixer``.
+
+    .. note:: Both single-channel and multi-channel signals are supported as reference
+        and added signals. The only requirement is that the when mixing 2 multi-channel
+        signals, they must have the same number of channels.
+
+    .. note:: When the AudioMixer contains multi-channel tracks, 2 types of mixed signals
+        can be generated:
+        - `mixed_audio` mixes each channel independently, and returns a multi-channel signal.
+          If there is a mono track, it is added to all the channels.
+        - `mixed_mono_audio` mixes all channels together, and returns a single-channel signal.
     """
 
     def __init__(
@@ -1193,6 +1238,7 @@ class AudioMixer:
         self.tracks = [base_audio]
         self.offsets = [0]
         self.sampling_rate = sampling_rate
+        self.num_channels = base_audio.shape[0]
         self.dtype = self.tracks[0].dtype
 
         # Keep a pre-computed energy value of the audio that we initialize the Mixer with;
@@ -1201,11 +1247,6 @@ class AudioMixer:
             self.reference_energy = audio_energy(base_audio)
         else:
             self.reference_energy = reference_energy
-
-        if self.reference_energy <= 0.0:
-            raise NonPositiveEnergyError(
-                f"To perform mix, energy must be non-zero and non-negative (got {self.reference_energy})"
-            )
 
     def _pad_track(
         self, audio: np.ndarray, offset: int, total: Optional[int] = None
@@ -1230,7 +1271,7 @@ class AudioMixer:
     @property
     def unmixed_audio(self) -> List[np.ndarray]:
         """
-        Return a list of numpy arrays with the shape (1, num_samples), where each track is
+        Return a list of numpy arrays with the shape (C, num_samples), where each track is
         zero padded and scaled adequately to the offsets and SNR used in ``add_to_mix`` call.
         """
         total = self.num_samples_total
@@ -1242,12 +1283,33 @@ class AudioMixer:
     @property
     def mixed_audio(self) -> np.ndarray:
         """
-        Return a numpy ndarray with the shape (1, num_samples) - a mono mix of the tracks
+        Return a numpy ndarray with the shape (num_channels, num_samples) - a mix of the tracks
+        supplied with ``add_to_mix`` calls.
+        """
+        total = self.num_samples_total
+        mixed = np.zeros((self.num_channels, total), dtype=self.dtype)
+        for offset, track in zip(self.offsets, self.tracks):
+            # Only two cases are possible here: either the track is mono, or it has the same
+            # number of channels as the mixer. For the latter case, we don't need to do anything
+            # special, as we can just add the track to the mix. For the former case, we need to
+            # add the mono track to all channels by repeating it.
+            if track.shape[0] == 1 and self.num_channels > 1:
+                track = np.tile(track, (self.num_channels, 1))
+            mixed[:, offset : offset + track.shape[1]] += track
+        return mixed
+
+    @property
+    def mixed_mono_audio(self) -> np.ndarray:
+        """
+        Return a numpy ndarray with the shape (1, num_samples) - a mix of the tracks
         supplied with ``add_to_mix`` calls.
         """
         total = self.num_samples_total
         mixed = np.zeros((1, total), dtype=self.dtype)
         for offset, track in zip(self.offsets, self.tracks):
+            if track.shape[0] > 1:
+                # Sum all channels of the track
+                track = np.sum(track, axis=0, keepdims=True)
             mixed[:, offset : offset + track.shape[1]] += track
         return mixed
 
@@ -1258,7 +1320,7 @@ class AudioMixer:
         offset: Seconds = 0.0,
     ):
         """
-        Add audio (only support mono-channel) of a new track into the mix.
+        Add audio of a new track into the mix.
         :param audio: An array of audio samples to be mixed in.
         :param snr: Signal-to-noise ratio, assuming `audio` represents noise (positive SNR - lower `audio` energy,
         negative SNR - higher `audio` energy)
@@ -1266,30 +1328,35 @@ class AudioMixer:
         the start with low energy values.
         :return:
         """
-        if len(audio) == 0:
+        if audio.size == 0:
             return  # do nothing for empty arrays
 
-        assert audio.shape[0] == 1  # TODO: support multi-channels
         assert offset >= 0.0, "Negative offset in mixing is not supported."
 
         num_samples_offset = compute_num_samples(offset, self.sampling_rate)
 
         # When SNR is requested, find what gain is needed to satisfy the SNR
         gain = 1.0
-        if snr is not None:
+        if snr is not None and self.reference_energy > 0:
             added_audio_energy = audio_energy(audio)
-            if added_audio_energy <= 0.0:
-                raise NonPositiveEnergyError(
-                    f"To perform mix, energy must be non-zero and non-negative (got {added_audio_energy}). "
-                )
-            target_energy = self.reference_energy * (10.0 ** (-snr / 10))
-            # When mixing time-domain signals, we are working with root-power (field) quantities,
-            # whereas the energy ratio applies to power quantities. To compute the gain correctly,
-            # we need to take a square root of the energy ratio.
-            gain = sqrt(target_energy / added_audio_energy)
-
+            if added_audio_energy > 0.0:
+                target_energy = self.reference_energy * (10.0 ** (-snr / 10))
+                # When mixing time-domain signals, we are working with root-power (field) quantities,
+                # whereas the energy ratio applies to power quantities. To compute the gain correctly,
+                # we need to take a square root of the energy ratio.
+                gain = sqrt(target_energy / added_audio_energy)
         self.tracks.append(gain * audio)
         self.offsets.append(num_samples_offset)
+        # We cannot mix 2 multi-channel audios with different number of channels.
+        if (
+            audio.shape[0] != self.num_channels
+            and self.num_channels != 1
+            and audio.shape[0] != 1
+        ):
+            raise ValueError(
+                f"Cannot mix audios with {audio.shape[0]} and {self.num_channels} channels."
+            )
+        self.num_channels = max(self.num_channels, audio.shape[0])
 
 
 def audio_energy(audio: np.ndarray) -> float:
@@ -1306,33 +1373,277 @@ def read_audio(
     duration: Optional[Seconds] = None,
     force_opus_sampling_rate: Optional[int] = None,
 ) -> Tuple[np.ndarray, int]:
-    # First handle special cases: OPUS and SPHERE (SPHERE may be encoded with shorten,
-    #   which can only be decoded by binaries "shorten" and "sph2pipe").
-    try:
-        if isinstance(path_or_fd, (str, Path)) and str(path_or_fd).lower().endswith(
-            ".opus"
-        ):
-            return read_opus(
-                path_or_fd,
-                offset=offset,
-                duration=duration,
-                force_opus_sampling_rate=force_opus_sampling_rate,
-            )
-        elif isinstance(path_or_fd, (str, Path)) and str(path_or_fd).lower().endswith(
-            ".sph"
-        ):
-            return read_sph(path_or_fd, offset=offset, duration=duration)
-        try:
-            return torchaudio_load(path_or_fd, offset=offset, duration=duration)
-        except:
-            try:
-                return soundfile_load(path_or_fd, offset=offset, duration=duration)
-            except:
-                return audioread_load(path_or_fd, offset=offset, duration=duration)
-    except Exception as e:
-        raise AudioLoadingError(
-            f"Reading audio from '{path_or_fd}' failed. Details: {type(e)}('{str(e)}')"
+    return get_default_audio_backend().read_audio(
+        path_or_fd=path_or_fd,
+        offset=offset,
+        duration=duration,
+        force_opus_sampling_rate=force_opus_sampling_rate,
+    )
+
+
+class AudioBackend:
+    """
+    Internal Lhotse abstraction. An AudioBackend defines three methods:
+    one for reading audio, and two filters that help determine if it should be used.
+
+    ``handle_special_case`` means this backend should be exclusively
+    used for a given type of input path/file.
+
+    ``is_applicable`` means this backend most likely can be used for a given type of input path/file,
+    but it may also fail. Its purpose is more to filter out formats that definitely are not supported.
+    """
+
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        raise NotImplementedError()
+
+    def handles_special_case(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return False
+
+    def is_applicable(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return True
+
+
+class FfmpegSubprocessOpusBackend(AudioBackend):
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ):
+        assert isinstance(
+            path_or_fd, (str, Path)
+        ), f"Cannot use an ffmpeg subprocess to read from path of type: '{type(path_or_fd)}'"
+        return read_opus_ffmpeg(
+            path=path_or_fd,
+            offset=offset,
+            duration=duration,
+            force_opus_sampling_rate=force_opus_sampling_rate,
         )
+
+    def handles_special_case(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return isinstance(path_or_fd, (str, Path)) and str(path_or_fd).lower().endswith(
+            ".opus"
+        )
+
+    def is_applicable(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return self.handles_special_case(path_or_fd)
+
+
+class Sph2pipeSubprocessBackend(AudioBackend):
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        assert isinstance(
+            path_or_fd, (str, Path)
+        ), f"Cannot use an sph2pipe subprocess to read from path of type: '{type(path_or_fd)}'"
+        return read_sph(
+            sph_path=path_or_fd,
+            offset=offset,
+            duration=duration,
+        )
+
+    def handles_special_case(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return isinstance(path_or_fd, (str, Path)) and str(path_or_fd).lower().endswith(
+            ".sph"
+        )
+
+    def is_applicable(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return self.handles_special_case(path_or_fd)
+
+
+class FfmpegTorchaudioStreamerBackend(AudioBackend):
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        return torchaudio_ffmpeg_load(
+            path_or_fileobj=path_or_fd,
+            offset=offset,
+            duration=duration,
+        )
+
+    def handles_special_case(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return torchaudio_supports_ffmpeg() and isinstance(path_or_fd, BytesIO)
+
+    def is_applicable(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        # Technically it's applicable with regular files as well, but for now
+        # we're not enabling that feature.
+        return torchaudio_supports_ffmpeg() and isinstance(path_or_fd, BytesIO)
+
+
+class TorchaudioDefaultBackend(AudioBackend):
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        return torchaudio_load(
+            path_or_fd=path_or_fd,
+            offset=offset,
+            duration=duration,
+        )
+
+
+class LibsndfileBackend(AudioBackend):
+    """
+    A backend that uses PySoundFile.
+
+    .. note:: PySoundFile has issues on MacOS because of the way its CFFI bindings are implemented.
+        For now, we disable it on this platform.
+        See: https://github.com/bastibe/python-soundfile/issues/331
+    """
+
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        return soundfile_load(
+            path_or_fd=path_or_fd,
+            offset=offset,
+            duration=duration,
+        )
+
+    def handles_special_case(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return not (sys.platform == "darwin") and isinstance(path_or_fd, BytesIO)
+
+    def is_applicable(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        # Technically it's applicable with regular files as well, but for now
+        # we're not enabling that feature.
+        return not (sys.platform == "darwin") and isinstance(path_or_fd, BytesIO)
+
+
+class AudioreadBackend(AudioBackend):
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        return audioread_load(
+            path_or_file=path_or_fd,
+            offset=offset,
+            duration=duration,
+        )
+
+
+class CompositeAudioBackend(AudioBackend):
+    def __init__(self, backends: List[AudioBackend]):
+        self.backends = backends
+
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        candidates = []
+        for b in self.backends:
+            if b.handles_special_case(path_or_fd):
+                candidates.append(b)
+
+        assert len(candidates) < 2, (
+            f"CompositeAudioBackend has more than one sub-backend that "
+            f"handles a given special case for input '{path_or_fd}'"
+        )
+
+        if len(candidates) == 1:
+            try:
+                return candidates[0].read_audio(
+                    path_or_fd=path_or_fd,
+                    offset=offset,
+                    duration=duration,
+                    force_opus_sampling_rate=force_opus_sampling_rate,
+                )
+            except Exception as e:
+                raise AudioLoadingError(
+                    f"Reading audio from '{path_or_fd}' failed. Details: {type(e)}: {str(e)}"
+                )
+
+        exceptions = []
+        for b in self.backends:
+            if b.is_applicable(path_or_fd):
+                try:
+                    return b.read_audio(
+                        path_or_fd=path_or_fd,
+                        offset=offset,
+                        duration=duration,
+                        force_opus_sampling_rate=force_opus_sampling_rate,
+                    )
+                except Exception as e:
+                    msg = f"Exception #{len(exceptions)} ({type(b)}): "
+                    if verbose_audio_loading_exceptions():
+                        exceptions.append(f"{msg}{traceback.format_exc()}")
+                    else:
+                        exceptions.append(f"{msg}{type(e)}: {str(e)}")
+
+        if not exceptions:
+            raise AudioLoadingError(
+                f"No applicable backend found for input: '{path_or_fd}'"
+            )
+        else:
+            NL = "\n"
+            maybe_info = (
+                ""
+                if verbose_audio_loading_exceptions()
+                else "\nSet LHOTSE_AUDIO_LOADING_EXCEPTION_VERBOSE=1 environment variable for full stack traces."
+            )
+            raise AudioLoadingError(
+                f"Reading audio from '{path_or_fd}' failed. Details:{NL}{NL.join(exceptions)}{maybe_info}"
+            )
+
+
+def verbose_audio_loading_exceptions() -> bool:
+    return os.environ.get("LHOTSE_AUDIO_LOADING_EXCEPTION_VERBOSE") == "1"
+
+
+@lru_cache(maxsize=1)
+def get_default_audio_backend():
+    """
+    Return a backend that can be used to read all audio formats supported by Lhotse.
+
+    It first looks for special cases that need very specific handling
+    (such as: opus, sphere/shorten, in-memory buffers)
+    and tries to match them against relevant audio backends.
+
+    Then, it tries to use several audio loading libraries (torchaudio, soundfile, audioread).
+    In case the first fails, it tries the next one, and so on.
+    """
+    return CompositeAudioBackend(
+        [
+            # First handle special cases: OPUS and SPHERE (SPHERE may be encoded with shorten,
+            #   which can only be decoded by binaries "shorten" and "sph2pipe").
+            FfmpegSubprocessOpusBackend(),
+            Sph2pipeSubprocessBackend(),
+            # Prefer libsndfile for in-memory buffers only
+            LibsndfileBackend(),
+            # Torchaudio should be able to deal with most audio types...
+            TorchaudioDefaultBackend(),
+            # ... if not, try audioread...
+            AudioreadBackend(),
+            # ... oops.
+        ]
+    )
 
 
 class LibsndfileCompatibleAudioInfo(NamedTuple):
@@ -1379,31 +1690,66 @@ def info(
             # If both fail, then Python 3 will display both exception messages.
 
 
-def torchaudio_info(path: Pathlike) -> LibsndfileCompatibleAudioInfo:
+@lru_cache(maxsize=1)
+def torchaudio_supports_ffmpeg() -> bool:
+    """
+    Returns ``True`` when torchaudio version is at least 0.12.0, which
+    has support for FFMPEG streamer API.
+    """
+    import torchaudio
+    from packaging import version
+
+    return version.parse(torchaudio.__version__) >= version.parse("0.12.0")
+
+
+@lru_cache(maxsize=1)
+def torchaudio_soundfile_supports_format() -> bool:
+    """
+    Returns ``True`` when torchaudio version is at least 0.9.0, which
+    has support for ``format`` keyword arg in ``torchaudio.save()``.
+    """
+    import torchaudio
+    from packaging import version
+
+    return version.parse(torchaudio.__version__) >= version.parse("0.9.0")
+
+
+def torchaudio_info(
+    path_or_fileobj: Union[Path, str, BytesIO]
+) -> LibsndfileCompatibleAudioInfo:
     """
     Return an audio info data structure that's a compatible subset of ``pysoundfile.info()``
     that we need to create a ``Recording`` manifest.
     """
     import torchaudio
-    from packaging import version
 
-    if (
-        isinstance(path, (str, Path))
-        and str(path).endswith(".mp3")
-        and version.parse(torchaudio.__version__) >= version.parse("0.12.0")
-    ):
+    is_mp3 = isinstance(path_or_fileobj, (str, Path)) and str(path_or_fileobj).endswith(
+        ".mp3"
+    )
+    is_fileobj = isinstance(path_or_fileobj, BytesIO)
+    if (is_mp3 or is_fileobj) and torchaudio_supports_ffmpeg():
         # Torchaudio 0.12 has a new StreamReader API that uses ffmpeg.
+        #
         # They dropped support for using sox bindings in torchaudio.info
         # for MP3 files and implicitly delegate the call to ffmpeg.
         # Unfortunately, they always return num_frames/num_samples = 0,
         # as explained here: https://github.com/pytorch/audio/issues/2524
         # We have to work around by streaming the MP3 and counting the number
         # of samples.
+        #
+        # Unfortunately torchaudio also has issues with reading from file objects
+        # sometimes, which apparently we can work around by using StreamReader API.
+        # See:
+        # - https://github.com/pytorch/audio/issues/2524#issuecomment-1223901818
+        # - https://github.com/pytorch/audio/issues/2662
         from torchaudio.io import StreamReader
 
-        streamer = StreamReader(src=str(path))
-        assert streamer.num_src_streams == 1
-        info = streamer.get_src_stream_info(0)
+        streamer = StreamReader(src=str(path_or_fileobj) if is_mp3 else path_or_fileobj)
+        assert streamer.num_src_streams == 1, (
+            "Lhotse doesn't support files with more than one source stream yet "
+            "(not to be confused with multi-channel)."
+        )
+        info = streamer.get_src_stream_info(streamer.default_audio_stream)
         streamer.add_basic_audio_stream(
             frames_per_chunk=int(info.sample_rate),
         )
@@ -1413,15 +1759,15 @@ def torchaudio_info(path: Pathlike) -> LibsndfileCompatibleAudioInfo:
         return LibsndfileCompatibleAudioInfo(
             channels=info.num_channels,
             frames=tot_samples,
-            samplerate=info.sample_rate,
+            samplerate=int(info.sample_rate),
             duration=tot_samples / info.sample_rate,
         )
 
-    info = torchaudio.info(path)
+    info = torchaudio.info(path_or_fileobj)
     return LibsndfileCompatibleAudioInfo(
         channels=info.num_channels,
         frames=info.num_frames,
-        samplerate=info.sample_rate,
+        samplerate=int(info.sample_rate),
         duration=info.num_frames / info.sample_rate,
     )
 
@@ -1449,6 +1795,48 @@ def torchaudio_load(
         frame_offset=frame_offset,
         num_frames=num_frames,
     )
+    return audio.numpy(), int(sampling_rate)
+
+
+def torchaudio_ffmpeg_load(
+    path_or_fileobj: Union[Path, str, BytesIO],
+    offset: Seconds = 0,
+    duration: Optional[Seconds] = None,
+) -> Tuple[np.ndarray, int]:
+    import torchaudio
+
+    if not torchaudio_supports_ffmpeg():
+        raise RuntimeError(
+            "Using FFMPEG streamer backend for reading is supported only "
+            "with PyTorch 1.12+ and torchaudio 0.12+"
+        )
+
+    if isinstance(path_or_fileobj, Path):
+        path_or_fileobj = str(path_or_fileobj)
+
+    streamer = torchaudio.io.StreamReader(src=path_or_fileobj)
+    assert streamer.num_src_streams == 1, (
+        "Lhotse doesn't support files with more than one source stream yet "
+        "(not to be confused with multi-channel)."
+    )
+    info = streamer.get_src_stream_info(streamer.default_audio_stream)
+    sampling_rate = int(info.sample_rate)
+
+    if duration is not None:
+        # Try to read whole audio in a single chunk.
+        streamer.add_basic_audio_stream(
+            frames_per_chunk=compute_num_samples(duration, sampling_rate)
+        )
+        streamer.seek(offset)
+        (audio,) = next(streamer.stream())
+        audio = audio.transpose(0, 1)
+    else:
+        # Read in 1 second chunks and concatenate (we don't know how much audio is incoming)
+        streamer.add_basic_audio_stream(frames_per_chunk=sampling_rate)
+        streamer.seek(offset)
+        audio = torch.cat([t.transpose(0, 1) for t, in streamer.stream()], dim=0)
+
+    # Return shape (num_channels, num_samples)
     return audio.numpy(), sampling_rate
 
 
@@ -1469,7 +1857,7 @@ def soundfile_load(
         # Load the target number of frames, and transpose to match librosa form
         return (
             sf_desc.read(frames=frame_duration, dtype=np.float32, always_2d=False).T,
-            sampling_rate,
+            int(sampling_rate),
         )
 
 
@@ -1493,7 +1881,7 @@ def audioread_info(path: Pathlike) -> LibsndfileCompatibleAudioInfo:
         return LibsndfileCompatibleAudioInfo(
             channels=input_file.channels,
             frames=num_samples,
-            samplerate=input_file.samplerate,
+            samplerate=int(input_file.samplerate),
             duration=num_samples / input_file.samplerate,
         )
 
@@ -1580,7 +1968,7 @@ def audioread_load(
     else:
         y = np.empty(0, dtype=dtype)
 
-    return y, sr_native
+    return y, int(sr_native)
 
 
 def _buf_to_float(x, n_bytes=2, dtype=np.float32):
@@ -1661,7 +2049,7 @@ def opus_info(
     return LibsndfileCompatibleAudioInfo(
         channels=samples.shape[0],
         frames=samples.shape[1],
-        samplerate=sampling_rate,
+        samplerate=int(sampling_rate),
         duration=samples.shape[1] / sampling_rate,
     )
 
@@ -1810,7 +2198,7 @@ def sph_info(path: Pathlike) -> LibsndfileCompatibleAudioInfo:
     return LibsndfileCompatibleAudioInfo(
         channels=samples.shape[0],
         frames=samples.shape[1],
-        samplerate=sampling_rate,
+        samplerate=int(sampling_rate),
         duration=samples.shape[1] / sampling_rate,
     )
 
@@ -1856,6 +2244,38 @@ def read_sph(
         audio = audio.reshape(1, -1) if sf_desc.channels == 1 else audio.T
 
     return audio, sampling_rate
+
+
+def torchaudio_save_flac_safe(
+    dest: Union[str, Path, BytesIO],
+    src: Union[torch.Tensor, np.ndarray],
+    sample_rate: int,
+    *args,
+    **kwargs,
+):
+    import torchaudio
+
+    src = torch.as_tensor(src)
+    saving_flac = kwargs.get("format") == "flac" or (
+        not isinstance(dest, BytesIO) and str(dest).endswith(".flac")
+    )
+    if torchaudio_soundfile_supports_format() and saving_flac:
+        # Prefer saving with soundfile backend whenever possible to avoid issue:
+        # https://github.com/pytorch/audio/issues/2662
+        # Saving with sox_io backend to FLAC may corrupt the file.
+        torchaudio.backend.soundfile_backend.save(
+            dest,
+            src,
+            sample_rate=sample_rate,
+            format=kwargs.pop("format", "flac"),
+            bits_per_sample=kwargs.pop("bits_per_sample", 16),
+            *args,
+            **kwargs,
+        )
+    else:
+        torchaudio.backend.sox_io_backend.save(
+            dest, src, sample_rate=sample_rate, *args, **kwargs
+        )
 
 
 class AudioLoadingError(Exception):

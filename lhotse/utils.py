@@ -1,13 +1,17 @@
+import ast
 import functools
+import hashlib
 import inspect
 import logging
 import math
 import random
+import sys
 import uuid
 import warnings
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from decimal import ROUND_HALF_DOWN, ROUND_HALF_UP, Decimal
+from itertools import chain
 from math import ceil, isclose
 from pathlib import Path
 from typing import (
@@ -16,6 +20,7 @@ from typing import (
     Dict,
     Generator,
     Iterable,
+    Iterator,
     List,
     Optional,
     Sequence,
@@ -24,6 +29,7 @@ from typing import (
     Union,
 )
 
+import click
 import numpy as np
 import torch
 from tqdm.auto import tqdm
@@ -178,6 +184,10 @@ class TimeSpan:
     start: Seconds
     end: Seconds
 
+    @property
+    def duration(self) -> Seconds:
+        return self.end - self.start
+
 
 # TODO: Ugh, Protocols are only in Python 3.8+...
 def overlaps(lhs: Any, rhs: Any) -> bool:
@@ -190,9 +200,15 @@ def overlaps(lhs: Any, rhs: Any) -> bool:
     )
 
 
-def overspans(spanning: Any, spanned: Any) -> bool:
+def overspans(spanning: Any, spanned: Any, tolerance: float = 1e-3) -> bool:
     """Indicates whether the left-hand-side time-span/segment covers the whole right-hand-side time-span/segment."""
-    return spanning.start <= spanned.start <= spanned.end <= spanning.end
+    # We add a small epsilon to the comparison to avoid floating-point precision issues.
+    return (
+        spanning.start - tolerance
+        <= spanned.start
+        <= spanned.end
+        <= spanning.end + tolerance
+    )
 
 
 def time_diff_to_num_frames(
@@ -378,6 +394,19 @@ def compute_num_frames(
     return num_frames
 
 
+def compute_num_frames_from_samples(
+    num_samples: int,
+    frame_shift: Seconds,
+    sampling_rate: int,
+) -> int:
+    """
+    Compute the number of frames from number of samples and frame_shift in a safe way.
+    """
+    window_hop = round(frame_shift * sampling_rate)
+    num_frames = int((num_samples + window_hop // 2) // window_hop)
+    return num_frames
+
+
 def compute_num_windows(sig_len: Seconds, win_len: Seconds, hop: Seconds) -> int:
     """
     Return a number of windows obtained from signal of length equal to ``sig_len``
@@ -457,6 +486,35 @@ def urlretrieve_progress(url, filename=None, data=None, desc=None):
     with tqdm(unit="B", unit_scale=True, unit_divisor=1024, miniters=1, desc=desc) as t:
         reporthook = tqdm_urlretrieve_hook(t)
         return urlretrieve(url=url, filename=filename, reporthook=reporthook, data=data)
+
+
+def safe_extract(
+    tar: Any,
+    path: Pathlike = ".",
+    members: Optional[List[str]] = None,
+    *,
+    numeric_owner: bool = False,
+) -> None:
+    """
+    Extracts a tar file in a safe way, avoiding path traversal attacks.
+    See: https://github.com/lhotse-speech/lhotse/pull/872
+    """
+
+    def _is_within_directory(directory, target):
+
+        abs_directory = directory.resolve()
+        abs_target = target.resolve()
+
+        return abs_directory in abs_target.parents
+
+    path = Path(path)
+
+    for member in tar.getmembers():
+        member_path = path / member.name
+        if not _is_within_directory(path, member_path):
+            raise Exception("Attempted Path Traversal in Tar File")
+
+    tar.extractall(path, members, numeric_owner=numeric_owner)
 
 
 class nullcontext(AbstractContextManager):
@@ -553,6 +611,20 @@ def compute_start_duration_for_extended_cut(
     return round(new_start, ndigits=15), new_duration
 
 
+def merge_items_with_delimiter(
+    values: Iterable[str], prefix: str = "cat", delimiter: str = "#"
+) -> Optional[str]:
+    # e.g.
+    # values = ["1125-76840-0001", "1125-53670-0003"]
+    # return "cat#1125-76840-0001#1125-53670-0003"
+    values = list(values)
+    if len(values) == 0:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return delimiter.join(chain([prefix], values))
+
+
 def index_by_id_and_check(manifests: Iterable[T]) -> Dict[str, T]:
     id2man = {}
     for m in manifests:
@@ -609,6 +681,14 @@ def is_none_or_gt(value, threshold) -> bool:
     return value is None or value > threshold
 
 
+def is_equal_or_contains(
+    value: Union[T, Sequence[T]], other: Union[T, Sequence[T]]
+) -> bool:
+    value = to_list(value)
+    other = to_list(other)
+    return set(other).issubset(set(value))
+
+
 def is_module_available(*modules: str) -> bool:
     r"""Returns if a top-level module with :attr:`name` exists *without**
     importing it. This is generally safer than try-catch block around a
@@ -640,6 +720,23 @@ def measure_overlap(lhs: Any, rhs: Any) -> float:
 def ifnone(item: Optional[Any], alt_item: Any) -> Any:
     """Return ``alt_item`` if ``item is None``, otherwise ``item``."""
     return alt_item if item is None else item
+
+
+def to_list(item: Union[Any, Sequence[Any]]) -> List[Any]:
+    """Convert ``item`` to a list if it is not already a list."""
+    return item if isinstance(item, list) else [item]
+
+
+def to_hashable(item: Any) -> Any:
+    """Convert ``item`` to a hashable type if it is not already hashable."""
+    return tuple(item) if isinstance(item, list) else item
+
+
+def hash_str_to_int(s: str, max_value: Optional[int] = None) -> int:
+    """Hash a string to an integer in the range [0, max_value)."""
+    if max_value is None:
+        max_value = sys.maxsize
+    return int(hashlib.sha1(s.encode("utf-8")).hexdigest(), 16) % max_value
 
 
 def lens_to_mask(lens: torch.IntTensor) -> torch.Tensor:
@@ -739,7 +836,7 @@ class suppress_and_warn:
 
 
 def streaming_shuffle(
-    data: Iterable[T],
+    data: Iterator[T],
     bufsize: int = 10000,
     rng: Optional[random.Random] = None,
 ) -> Generator[T, None, None]:
@@ -773,8 +870,9 @@ def streaming_shuffle(
                 buf.append(next(data))
             except StopIteration:
                 pass
-        k = rng.randint(0, len(buf) - 1)
-        sample, buf[k] = buf[k], sample
+        if len(buf) > 0:
+            k = rng.randint(0, len(buf) - 1)
+            sample, buf[k] = buf[k], sample
         if startup and len(buf) < bufsize:
             buf.append(sample)
             continue
@@ -782,3 +880,133 @@ def streaming_shuffle(
         yield sample
     for sample in buf:
         yield sample
+
+
+def pairwise(iterable):
+    "s -> (s0,s1), (s1,s2), (s2, s3), ..."
+    from itertools import tee
+
+    a, b = tee(iterable)
+    next(b, None)
+    return zip(a, b)
+
+
+class Pipe:
+    """Wrapper class for subprocess.Pipe.
+
+    This class looks like a stream from the outside, but it checks
+    subprocess status and handles timeouts with exceptions.
+    This way, clients of the class do not need to know that they are
+    dealing with subprocesses.
+
+    Note: This class is based on WebDataset and modified here.
+    Original source is in https://github.com/webdataset/webdataset
+
+    :param *args: passed to `subprocess.Pipe`
+    :param **kw: passed to `subprocess.Pipe`
+    :param timeout: timeout for closing/waiting
+    :param ignore_errors: don't raise exceptions on subprocess errors
+    :param ignore_status: list of status codes to ignore
+    """
+
+    def __init__(
+        self,
+        *args,
+        mode: str,
+        timeout: float = 7200.0,
+        ignore_errors: bool = False,
+        ignore_status: Optional[List] = None,
+        **kw,
+    ):
+        """Create an IO Pipe."""
+        from subprocess import PIPE, Popen
+
+        self.ignore_errors = ignore_errors
+        # 0 => correct program exit
+        # 141 => broken pipe (e.g. because the main program was terminated)
+        self.ignore_status = [0, 141] + ifnone(ignore_status, [])
+        self.timeout = timeout
+        self.args = (args, kw)
+        if mode[0] == "r":
+            self.proc = Popen(*args, stdout=PIPE, text="b" not in mode, **kw)
+            self.stream = self.proc.stdout
+            if self.stream is None:
+                raise ValueError(f"{args}: couldn't open")
+        elif mode[0] == "w":
+            self.proc = Popen(*args, stdin=PIPE, text="b" not in mode, **kw)
+            self.stream = self.proc.stdin
+            if self.stream is None:
+                raise ValueError(f"{args}: couldn't open")
+        self.status = None
+
+    def __str__(self):
+        return f"<Pipe {self.args}>"
+
+    def check_status(self):
+        """Poll the process and handle any errors."""
+        status = self.proc.poll()
+        if status is not None:
+            self.wait_for_child()
+
+    def is_running(self) -> bool:
+        return self.proc.poll() is None
+
+    def wait_for_child(self):
+        """Check the status variable and raise an exception if necessary."""
+        if self.status is not None:
+            return
+        self.status = self.proc.wait()
+        if self.status not in self.ignore_status and not self.ignore_errors:
+            raise Exception(f"{self.args}: exit {self.status} (read)")
+
+    def read(self, *args, **kw):
+        """Wrap stream.read and checks status."""
+        result = self.stream.read(*args, **kw)
+        self.check_status()
+        return result
+
+    def write(self, *args, **kw):
+        """Wrap stream.write and checks status."""
+        result = self.stream.write(*args, **kw)
+        self.check_status()
+        return result
+
+    def readline(self, *args, **kw):
+        """Wrap stream.readLine and checks status."""
+        result = self.stream.readline(*args, **kw)
+        self.status = self.proc.poll()
+        self.check_status()
+        return result
+
+    def close(self):
+        """Wrap stream.close, wait for the subprocess, and handle errors."""
+        self.stream.close()
+        self.status = self.proc.wait(self.timeout)
+        self.wait_for_child()
+
+    def __iter__(self):
+        retval = self.readline()
+        while retval:
+            yield retval
+            retval = self.readline()
+
+    def __enter__(self):
+        """Context handler."""
+        return self
+
+    def __exit__(self, etype, value, traceback):
+        """Context handler."""
+        self.close()
+
+
+# Class to accept list of arguments as Click option
+class PythonLiteralOption(click.Option):
+    def type_cast_value(self, ctx, value):
+        try:
+            val = ast.literal_eval(value)
+            if isinstance(val, list) or isinstance(val, tuple):
+                return val[0] if len(val) == 1 else val
+            else:
+                return val
+        except:
+            return None

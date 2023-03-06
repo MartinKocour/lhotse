@@ -17,7 +17,24 @@ from tqdm.auto import tqdm
 from lhotse import validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, safe_extract, urlretrieve_progress
+
+
+def text_normalize(line: str):
+    """
+    Modified from https://github.com/wenet-e2e/wenet/blob/main/examples/multi_cn/s0/local/aishell_data_prep.sh#L54
+    sed 's/ａ/a/g' | sed 's/ｂ/b/g' |\
+    sed 's/ｃ/c/g' | sed 's/ｋ/k/g' |\
+    sed 's/ｔ/t/g' > $dir/transcripts.t
+
+    """
+    line = line.replace("ａ", "a")
+    line = line.replace("ｂ", "b")
+    line = line.replace("ｃ", "c")
+    line = line.replace("ｋ", "k")
+    line = line.replace("ｔ", "t")
+    line = line.upper()
+    return line
 
 
 def download_aishell(
@@ -51,12 +68,12 @@ def download_aishell(
             )
         shutil.rmtree(extracted_dir, ignore_errors=True)
         with tarfile.open(tar_path) as tar:
-            tar.extractall(path=corpus_dir)
+            safe_extract(tar, path=corpus_dir)
         if tar_name == dataset_tar_name:
             wav_dir = extracted_dir / "wav"
             for sub_tar_name in os.listdir(wav_dir):
                 with tarfile.open(wav_dir / sub_tar_name) as tar:
-                    tar.extractall(path=wav_dir)
+                    safe_extract(tar, path=wav_dir)
         completed_detector.touch()
 
     return corpus_dir
@@ -81,7 +98,9 @@ def prepare_aishell(
     with open(transcript_path, "r", encoding="utf-8") as f:
         for line in f.readlines():
             idx_transcript = line.split()
-            transcript_dict[idx_transcript[0]] = " ".join(idx_transcript[1:])
+            content = " ".join(idx_transcript[1:])
+            content = text_normalize(content)
+            transcript_dict[idx_transcript[0]] = content
     manifests = defaultdict(dict)
     dataset_parts = ["train", "dev", "test"]
     for part in tqdm(

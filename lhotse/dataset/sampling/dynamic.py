@@ -168,6 +168,11 @@ class DynamicCutSampler(CutSampler):
     def __iter__(self) -> "DynamicCutSampler":
         if self._just_restored_state:
             return self
+        # Why reset the current epoch?
+        # Either we are iterating the epoch for the first time and it's a no-op,
+        # or we are iterating the same epoch again, in which case setting more steps
+        # than are actually available per epoch would have broken the checkpoint restoration.
+        self.diagnostics.reset_current_epoch()
         self.rng = random.Random(self.seed + self.epoch)
         # Initiate iteration
         self.cuts_iter = [iter(cs) for cs in self.cuts]
@@ -230,11 +235,10 @@ class DurationBatcher:
     def __init__(
         self,
         datapipe: Iterable[Union[Cut, Tuple[Cut]]],
-        max_frames: int = None,
-        max_samples: int = None,
         max_duration: Seconds = None,
         max_cuts: Optional[int] = None,
         drop_last: bool = False,
+        quadratic_duration: Optional[Seconds] = None,
         diagnostics: Optional[SamplingDiagnostics] = None,
     ) -> None:
         self.datapipe = datapipe
@@ -243,9 +247,8 @@ class DurationBatcher:
         self.diagnostics = ifnone(diagnostics, SamplingDiagnostics())
         self.time_constraint = TimeConstraint(
             max_duration=max_duration,
-            max_frames=max_frames,
-            max_samples=max_samples,
             max_cuts=max_cuts,
+            quadratic_duration=quadratic_duration,
         )
 
     def __iter__(self) -> Generator[Union[CutSet, Tuple[CutSet]], None, None]:

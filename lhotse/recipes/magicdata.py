@@ -19,7 +19,56 @@ from tqdm.auto import tqdm
 from lhotse import validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, safe_extract, urlretrieve_progress
+
+
+def text_normalize(line: str):
+    r"""
+    Modified from https://github.com/wenet-e2e/wenet/blob/main/examples/multi_cn/s0/local/magicdata_data_prep.sh#L41
+    sed 's/！//g' | sed 's/？//g' |\
+    sed 's/，//g' | sed 's/－//g' |\
+    sed 's/：//g' | sed 's/；//g' |\
+    sed 's/　//g' | sed 's/。//g' |\
+    sed 's/`//g' | sed 's/,//g' |\
+    sed 's/://g' | sed 's/?//g' |\
+    sed 's/\///g' | sed 's/·//g' |\
+    sed 's/\"//g' | sed 's/“//g' |\
+    sed 's/”//g' | sed 's/\\//g' |\
+    sed 's/…//g' | sed "s///g" |\
+    sed 's/、//g' | sed "s///g" | sed 's/《//g' | sed 's/》//g' |\
+    sed 's/\[//g' | sed 's/\]//g' | sed 's/FIL//g' | sed 's/SPK//' |\
+    tr '[a-z]' '[A-Z]' |\
+    """
+    line = line.replace("！", "")
+    line = line.replace("？", "")
+    line = line.replace("，", "")
+    line = line.replace("－", "")
+    line = line.replace("：", "")
+    line = line.replace("；", "")
+    line = line.replace("　", "")
+    line = line.replace("。", "")
+    line = line.replace("`", "")
+    line = line.replace(",", "")
+    line = line.replace(":", "")
+    line = line.replace("?", "")
+    line = line.replace("/", "")
+    line = line.replace("·", "")
+    line = line.replace('"', "")
+    line = line.replace("“", "")
+    line = line.replace("”", "")
+    line = line.replace("\\", "")
+    line = line.replace("…", "")
+    line = line.replace("、", "")
+    line = line.replace("[ ", "")
+    line = line.replace("[", "")
+    line = line.replace("]", "")
+    line = line.replace("《 ", "")
+    line = line.replace("《", "")
+    line = line.replace("》", "")
+    line = line.replace("FIL", "")
+    line = line.replace("SPK", "")
+    line = line.upper()
+    return line
 
 
 def download_magicdata(
@@ -56,7 +105,7 @@ def download_magicdata(
             )
         shutil.rmtree(extracted_dir, ignore_errors=True)
         with tarfile.open(tar_path) as tar:
-            tar.extractall(path=corpus_dir)
+            safe_extract(tar, path=corpus_dir)
         completed_detector.touch()
 
     return corpus_dir
@@ -94,7 +143,9 @@ def prepare_magicdata(
                 ):
                     continue
                 idx_ = idx_transcript[0].split(".")[0]
-                transcript_dict[idx_] = " ".join(idx_transcript[2:])
+                content = " ".join(idx_transcript[2:])
+                content = text_normalize(content)
+                transcript_dict[idx_] = content
 
     manifests = defaultdict(dict)
     for part in tqdm(

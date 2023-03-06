@@ -21,7 +21,7 @@ from tqdm.auto import tqdm
 from lhotse import validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, safe_extract, urlretrieve_progress
 
 
 def download_aidatatang_200zh(
@@ -53,7 +53,7 @@ def download_aidatatang_200zh(
         )
     shutil.rmtree(extracted_dir, ignore_errors=True)
     with tarfile.open(tar_path) as tar:
-        tar.extractall(path=corpus_dir)
+        safe_extract(tar, path=corpus_dir)
 
     wav_dir = extracted_dir / "corpus"
     for s in ["test", "dev", "train"]:
@@ -61,7 +61,7 @@ def download_aidatatang_200zh(
         logging.info(f"Processing {d}")
         for sub_tar_name in os.listdir(d):
             with tarfile.open(d / sub_tar_name) as tar:
-                tar.extractall(path=d)
+                safe_extract(tar, path=d)
     completed_detector.touch()
 
     return corpus_dir
@@ -93,7 +93,10 @@ def prepare_aidatatang_200zh(
     with open(transcript_path, "r", encoding="utf-8") as f:
         for line in f.readlines():
             idx_transcript = line.split()
-            transcript_dict[idx_transcript[0]] = " ".join(idx_transcript[1:])
+            content = " ".join(idx_transcript[1:])
+            content = content.replace("Ａ", "A")
+            content = content.upper()
+            transcript_dict[idx_transcript[0]] = content
     manifests = defaultdict(dict)
     dataset_parts = ["dev", "test", "train"]
 

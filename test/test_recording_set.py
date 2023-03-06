@@ -12,6 +12,7 @@ from lhotse.audio import (
     DurationMismatchError,
     Recording,
     RecordingSet,
+    set_audio_duration_mismatch_tolerance,
 )
 from lhotse.testing.dummies import DummyManifest
 from lhotse.utils import INT16MAX, fastcopy
@@ -97,6 +98,18 @@ def test_get_audio_multichannel(
     with exception_expectation:
         loaded_audio = recording_set.load_audio("recording-1", channels=channels)
         np.testing.assert_almost_equal(loaded_audio, expected_audio)
+
+
+@mark.parametrize(
+    ["duration_tolerance", "exception_expectation"],
+    [(0.025, raises(DurationMismatchError)), (0.2, does_not_raise())],
+)
+def test_get_audio_multichannel_duration_mismatch(
+    recording_set, duration_tolerance, exception_expectation
+):
+    set_audio_duration_mismatch_tolerance(duration_tolerance)
+    with exception_expectation:
+        recording_set.load_audio("recording-4", channels=[0, 1])
 
 
 @mark.parametrize(
@@ -441,6 +454,57 @@ class TestAudioMixer:
         np.testing.assert_equal(xmix[:sr], x1)
         # 1s - 1.5s: padding
         np.testing.assert_equal(xmix[sr:], 0)
+
+    def test_audio_mixer_mix_multi_channel_inputs(self):
+        sr = 16000
+        t = np.linspace(0, 1, sr, dtype=np.float32)
+        x1 = np.sin(440.0 * t).reshape(1, -1).repeat(2, axis=0)
+        x2 = np.sin(880.0 * t).reshape(1, -1).repeat(2, axis=0)
+        y = x1 + x2
+        y_mono = y.sum(axis=0, keepdims=True)
+
+        mixer = AudioMixer(
+            base_audio=x1,
+            sampling_rate=sr,
+        )
+        mixer.add_to_mix(x2)
+
+        xmix = mixer.mixed_audio
+        xmix_mono = mixer.mixed_mono_audio
+        np.testing.assert_equal(xmix, y)
+        np.testing.assert_equal(xmix_mono, y_mono)
+
+    def test_audio_mixer_mix_mono_with_multi(self):
+        sr = 16000
+        t = np.linspace(0, 1, sr, dtype=np.float32)
+        x1 = np.sin(440.0 * t).reshape(1, -1).repeat(2, axis=0)
+        x2 = np.sin(880.0 * t).reshape(1, -1)
+        y = x1 + x2
+        y_mono = x1.sum(axis=0, keepdims=True) + x2
+
+        mixer = AudioMixer(
+            base_audio=x1,
+            sampling_rate=sr,
+        )
+        mixer.add_to_mix(x2)
+
+        xmix = mixer.mixed_audio
+        xmix_mono = mixer.mixed_mono_audio
+        np.testing.assert_equal(xmix, y)
+        np.testing.assert_equal(xmix_mono, y_mono)
+
+    def test_audio_mixer_mix_multi_with_multi_incompatible(self):
+        sr = 16000
+        t = np.linspace(0, 1, sr, dtype=np.float32)
+        x1 = np.sin(440.0 * t).reshape(1, -1).repeat(2, axis=0)
+        x2 = np.sin(880.0 * t).reshape(1, -1).repeat(3, axis=0)
+
+        mixer = AudioMixer(
+            base_audio=x1,
+            sampling_rate=sr,
+        )
+        with pytest.raises(ValueError):
+            mixer.add_to_mix(x2)
 
 
 @pytest.mark.skipif(
