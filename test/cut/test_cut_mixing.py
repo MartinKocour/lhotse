@@ -14,6 +14,27 @@ from lhotse.utils import nullcontext as does_not_raise
 # standard Pytest fixtures located in test/cut/conftest.py
 
 
+@pytest.fixture
+def stereo_cut():
+    return MultiCut(
+        id="multi-cut-1",
+        start=0.0,
+        duration=1.0,
+        channel=[0, 1],
+        recording=Recording.from_file(
+            "test/fixtures/stereo.wav", recording_id="irrelevant"
+        ),
+        supervisions=[
+            SupervisionSegment(
+                id="sup-1", recording_id="irrelevant", start=0.1, duration=0.5
+            ),
+            SupervisionSegment(
+                id="sup-2", recording_id="irrelevant", start=0.7, duration=0.2
+            ),
+        ],
+    )
+
+
 def test_append_cut_duration_and_supervisions(cut1, cut2):
     appended_cut = cut1.append(cut2)
 
@@ -69,6 +90,22 @@ def test_append_mono_cut_with_multi_cut(cut1, multi_cut2):
         ),
         SupervisionSegment(
             id="sup-3", recording_id="irrelevant", start=13.0, duration=2.5
+        ),
+    ]
+
+
+def test_multi_cut_downmix(stereo_cut):
+    mono_cut = stereo_cut.to_mono(mono_downmix=True)
+    assert isinstance(mono_cut, MonoCut)
+    assert mono_cut.num_channels == 1
+    assert mono_cut.num_samples == 8000
+    assert mono_cut.duration == 1.0
+    assert mono_cut.supervisions == [
+        SupervisionSegment(
+            id="sup-1", recording_id="irrelevant", start=0.1, duration=0.5
+        ),
+        SupervisionSegment(
+            id="sup-2", recording_id="irrelevant", start=0.7, duration=0.2
         ),
     ]
 
@@ -143,6 +180,16 @@ def mixed_audio_cut() -> MixedCut:
     return mixed_cut
 
 
+@pytest.fixture
+def offseted_mixed_audio_cut() -> MixedCut:
+    cut_set = CutSet.from_json(
+        "test/fixtures/mix_cut_test/offseted_audio_cut_manifest.json"
+    )
+    mixed_cut = cut_set["mixed-cut-id"]
+    assert isclose(mixed_cut.duration, 16.66)
+    return mixed_cut
+
+
 def test_mixed_cut_load_audio_mixed(mixed_audio_cut):
     audio = mixed_audio_cut.load_audio()
     assert audio.shape == (1, 230400)
@@ -154,6 +201,11 @@ def test_mixed_cut_load_audio_unmixed(mixed_audio_cut):
     assert len(audio) == 2
     assert audio[0].shape == (1, 230400)
     assert audio[1].shape == (1, 230400)
+
+
+def test_mixed_cut_load_offseted_mixed(offseted_mixed_audio_cut):
+    audio = offseted_mixed_audio_cut.load_audio()
+    assert audio.shape == (1, 266560)
 
 
 @pytest.mark.parametrize(
@@ -287,6 +339,12 @@ def test_mix_cut_snr(libri_cut):
     assert E(feats) > E(feats_snr)
 
 
+def test_mix_cut_with_other_raises_error(libri_cut):
+    libri_cut = libri_cut.drop_features()
+    with pytest.raises(ValueError):
+        _ = libri_cut.mix(libri_cut.recording)
+
+
 def test_mix_cut_snr_truncate_snr_reference(libri_cut):
     mixed = libri_cut.pad(duration=20).mix(libri_cut, offset_other_by=10)
     mixed_snr = libri_cut.pad(duration=20).mix(libri_cut, offset_other_by=10, snr=10)
@@ -343,6 +401,28 @@ def test_mix_cut_snr_pad_both(libri_cut):
     assert E(feats_snr) > E(feats)
     assert E(feats_nosnr) > E(feats)
     assert E(feats_nosnr) > E(feats_snr)
+
+
+@pytest.mark.parametrize("mix_first", [True, False])
+def test_mix_cut_with_transform(libri_cut, mix_first):
+    # Create original mixed cut
+    padded = libri_cut.pad(duration=20, direction="right")
+    # Create transformed mixed cut
+    padded = padded.reverb_rir(mix_first=mix_first)
+    # Mix another cut
+    mixed1 = padded.mix(libri_cut)
+    mixed2 = libri_cut.mix(padded)
+
+    assert isinstance(padded, MixedCut)
+    assert len(padded.tracks) == 2
+    assert isinstance(mixed1, MixedCut)
+    assert isinstance(mixed2, MixedCut)
+    if mix_first:
+        assert len(mixed1.tracks) == 2
+        assert len(mixed2.tracks) == 2
+    else:
+        assert len(mixed1.tracks) == 3
+        assert len(mixed2.tracks) == 3
 
 
 def test_cut_set_mix_snr_is_deterministic():

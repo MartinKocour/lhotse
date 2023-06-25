@@ -490,7 +490,7 @@ class Cut:
                     len(set(to_hashable(s.channel) for s in trimmed.supervisions)) == 1
                 ), (
                     "Trimmed cut has supervisions with different channels. Either set "
-                    "`ignore_channel=True` to keep original channels or `keep_overlapping=False` "
+                    "`keep_all_channels=True` to keep original channels or `keep_overlapping=False` "
                     "to retain only 1 supervision per trimmed cut."
                 )
                 trimmed.channel = trimmed.supervisions[0].channel
@@ -652,6 +652,7 @@ class Cut:
         supervision_group = [supervisions[0]]
         cur_end = supervisions[0].end
         new_cuts = []
+        group_idx = 0
         for sup in supervisions[1:]:
             if sup.start - cur_end <= max_pause:
                 supervision_group.append(sup)
@@ -666,8 +667,9 @@ class Cut:
                         offset=offset,
                         duration=duration,
                         keep_excessive_supervisions=False,
-                    )
+                    ).with_id(f"{self.id}-{max_pause}-{group_idx}")
                 )
+                group_idx += 1
                 supervision_group = [sup]
                 cur_end = sup.end
 
@@ -680,7 +682,7 @@ class Cut:
                     offset=offset,
                     duration=duration,
                     keep_excessive_supervisions=False,
-                )
+                ).with_id(f"{self.id}-{max_pause}-{group_idx}")
             )
         # The total number of supervisions should be the same.
         assert sum(len(c.supervisions) for c in new_cuts) == len(self.supervisions), (
@@ -724,7 +726,7 @@ class Cut:
                     offset=hop * i,
                     duration=duration,
                     keep_excessive_supervisions=keep_excessive_supervisions,
-                )
+                ).with_id(f"{self.id}-{i}")
             )
         return CutSet.from_cuts(new_cuts)
 
@@ -1001,7 +1003,7 @@ class Cut:
                     et = (
                         round(ali.end * self.sampling_rate)
                         if ali.end < self.duration
-                        else self.duration * self.sampling_rate
+                        else round(self.duration * self.sampling_rate)
                     )
                     mask[st:et] = 1.0
             else:
@@ -1013,7 +1015,7 @@ class Cut:
                 et = (
                     round(supervision.end * self.sampling_rate)
                     if supervision.end < self.duration
-                    else self.duration * self.sampling_rate
+                    else round(self.duration * self.sampling_rate)
                 )
                 mask[st:et] = 1.0
         return mask
